@@ -197,6 +197,7 @@ backup_and_reinitialize() {
     log_info "重新克隆项目..."
     git clone "$GIT_REPO" "$PROJECT_NAME"
     cd "$INSTALL_DIR"
+    cd "$INSTALL_DIR"
     
     # 恢复配置文件
     log_info "恢复配置文件..."
@@ -260,19 +261,28 @@ check_system_requirements() {
 }
 
 # 安装 Node.js (简化版)
+# 安装 Node.js (更新为21版本)
 install_nodejs() {
     if command_exists node; then
         local node_version=$(node --version | sed 's/v//')
         local major_version=$(echo $node_version | cut -d. -f1)
-        if [ "$major_version" -ge 18 ]; then
+        if [ "$major_version" -ge 21 ]; then
             log_success "Node.js 已安装: v$node_version"
             return
+        else
+            log_warning "Node.js 版本过低: v$node_version，需要 >= 21.0.0"
         fi
     fi
     
-    log_info "通过apt安装Node.js..."
+    log_info "安装 Node.js 21.x..."
+    
+    # 移除旧版本
+    sudo apt remove -y nodejs npm 2>/dev/null || true
+    
+    # 添加NodeSource仓库并安装Node.js 21
+    curl -fsSL https://deb.nodesource.com/setup_21.x | sudo -E bash -
     sudo apt update
-    sudo apt install -y nodejs npm
+    sudo apt install -y nodejs
     
     # 配置npm使用国内镜像
     npm config set registry https://registry.npmmirror.com
@@ -369,6 +379,32 @@ install_rush() {
     log_success "Rush.js 安装完成"
 }
 
+# 安装 Docker (可选)
+install_docker() {
+    if command_exists docker && command_exists docker-compose; then
+        log_success "Docker 已安装"
+        return
+    fi
+    
+    log_info "安装 Docker..."
+    
+    # 更新包列表
+    sudo apt update
+    
+    # 安装Docker
+    sudo apt install -y docker.io docker-compose
+    
+    # 启动Docker服务
+    sudo systemctl enable docker
+    sudo systemctl start docker
+    
+    # 添加用户到docker组
+    sudo usermod -aG docker $USER
+    
+    log_success "Docker 安装完成！"
+    log_info "请重新登录以使docker组权限生效，或运行: newgrp docker"
+}
+
 # 检查并启动数据库服务
 setup_database_services() {
     log_info "检查数据库服务..."
@@ -395,19 +431,57 @@ setup_database_services() {
             exit 1
         fi
     else
-        log_warning "Docker 未安装，请手动安装以下服务："
-        echo "  - MySQL 8.0+"
-        echo "  - Redis 6.0+"
-        echo "  - etcd 3.5+"
-        echo "  - MinIO (可选，用于文件存储)"
-        echo "  - RocketMQ (可选，用于消息队列)"
+        log_warning "Docker 未安装或不可用"
         echo
-        read -p "是否已手动安装这些服务？(y/N): " -n 1 -r
+        echo "您可以选择："
+        echo "1. 自动安装 Docker 并使用容器化服务（推荐）"
+        echo "2. 手动安装以下服务："
+        echo "   - MySQL 8.0+"
+        echo "   - Redis 6.0+"
+        echo "   - etcd 3.5+"
+        echo "   - MinIO (可选，用于文件存储)"
+        echo "   - RocketMQ (可选，用于消息队列)"
+        echo "3. 跳过数据库服务配置（稍后手动配置）"
         echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            log_error "请先安装必要的数据库服务"
-            exit 1
-        fi
+        read -p "请选择 (1/2/3): " -n 1 -r
+        echo
+        case $REPLY in
+            1)
+                log_info "开始安装 Docker..."
+                install_docker
+                log_info "Docker 安装完成！正在重新检查服务..."
+                # 重新加载用户组权限
+                newgrp docker << EONG
+                    # 重新检查Docker并启动服务
+                    if command_exists docker && command_exists docker-compose; then
+                        if [ -f "docker/docker-compose.yml" ]; then
+                            cd docker
+                            docker-compose up -d mysql redis etcd minio rocketmq
+                            log_info "等待数据库服务启动..."
+                            sleep 10
+                            cd ..
+                            log_success "数据库服务启动完成"
+                        fi
+                    fi
+EONG
+                ;;
+            2)
+                read -p "是否已手动安装这些服务？(y/N): " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    log_error "请先安装必要的数据库服务"
+                    exit 1
+                fi
+                ;;
+            3)
+                log_warning "跳过数据库服务配置，请稍后手动配置"
+                return
+                ;;
+            *)
+                log_error "无效选择"
+                exit 1
+                ;;
+        esac
     fi
 }
 
@@ -645,6 +719,7 @@ Coze Studio 本地部署脚本 (增强版)
 
 选项:
   -h, --help              显示此帮助信息
+  --install-docker        仅安装 Docker（不部署应用）
   --ollama-host HOST      Ollama 服务器地址 (默认: localhost)
   --ollama-port PORT      Ollama 服务器端口 (默认: 11434)
   --remote-access         启用远程访问
@@ -653,6 +728,7 @@ Coze Studio 本地部署脚本 (增强版)
 
 示例:
   $0                                    # 标准部署
+  $0 --install-docker                   # 仅安装 Docker
   $0 --ollama-host 192.168.1.100       # 指定 Ollama 服务器
   $0 --remote-access                    # 启用远程访问
   $0 --skip-build                       # 跳过构建（适用于重新启动）
@@ -693,6 +769,7 @@ EOF
 main() {
     local skip_build=false
     local backup_only=false
+    local install_docker_only=false
     
     # 解析命令行参数
     while [[ $# -gt 0 ]]; do
@@ -700,6 +777,10 @@ main() {
             -h|--help)
                 show_help
                 exit 0
+                ;;
+            --install-docker)
+                install_docker_only=true
+                shift
                 ;;
             --ollama-host)
                 OLLAMA_HOST="$2"
@@ -732,17 +813,12 @@ main() {
     echo "=== Coze Studio 本地部署脚本 (增强版) ==="
     echo
     
-    # 仅备份模式
-    if [ "$backup_only" = true ]; then
-        if [ -d "$INSTALL_DIR" ]; then
-            cd "$INSTALL_DIR"
-            backup_and_reinitialize
-            log_success "备份完成，退出"
-            exit 0
-        else
-            log_error "未找到现有安装"
-            exit 1
-        fi
+    # 仅安装Docker模式
+    if [ "$install_docker_only" = true ]; then
+        check_system_requirements
+        install_docker
+        log_success "Docker 安装完成！请重新登录或运行 'newgrp docker' 使权限生效"
+        exit 0
     fi
     
     # 检查系统要求
